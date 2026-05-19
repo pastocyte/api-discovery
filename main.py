@@ -84,7 +84,7 @@ def run(args: argparse.Namespace) -> None:
         logging.info("Repository:        %s", repo_url)
 
         try:
-            with cloned_repo(repo_url) as local_path:
+            with cloned_repo(repo_url, github_token=args.github_token) as local_path:
                 result = analyze(local_path)
         except Exception as exc:
             logging.error("Failed to process '%s': %s – skipping", name, exc)
@@ -147,6 +147,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Substring to match against service names (case-insensitive). "
              "Omit to analyse all services.",
+    )
+    parser.add_argument(
+        "--github-token",
+        default=os.environ.get("GITHUB_TOKEN", ""),
+        help="Personal Access Token for GitHub / GitHub Enterprise. "
+             "Required when the org enforces SAML SSO — the token must be "
+             "authorised for the SSO organisation. "
+             "Can also be set via GITHUB_TOKEN env var.",
     )
     parser.add_argument(
         "--github-url",
