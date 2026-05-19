@@ -1,7 +1,14 @@
 """
 codebase_analyzer.py
 --------------------
-Scans a locally cloned repository for API endpoints.
+Scans a repository for API endpoints.
+
+Two entry points are provided:
+
+* :func:`analyze` – scans a **locally cloned** repository (original mode).
+* :func:`analyze_remote` – scans a **remote repository via API** without
+  cloning.  Pass a :class:`~remote_repo_client.RemoteRepoClient` (GitHub or
+  GitLab) together with the owner/repo slugs and an optional ref.
 
 Strategy
 ~~~~~~~~
@@ -26,9 +33,12 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import yaml
+
+if TYPE_CHECKING:
+    from remote_repo_client import RemoteRepoClient, RemoteFile
 
 logger = logging.getLogger(__name__)
 
@@ -246,4 +256,161 @@ def analyze(repo_root: Path) -> AnalysisResult:
     logger.info("No OpenAPI spec found – falling back to regex heuristics")
     endpoints = _scan_with_regex(repo_root)
     logger.info("Regex analysis found %d endpoints", len(endpoints))
+    return AnalysisResult(method="Regex", endpoints=endpoints)
+
+
+# ---------------------------------------------------------------------------
+# Remote (no-clone) analysis
+# ---------------------------------------------------------------------------
+
+# Maximum file size to fetch via API (bytes).  Larger files are skipped to
+# avoid excessive API calls on auto-generated or minified assets.
+_MAX_REMOTE_FILE_SIZE = 512_000
+
+
+def _should_scan_remote(remote_file: "RemoteFile") -> bool:
+    """Return True if *remote_file* is worth fetching for regex analysis.
+
+    Applies the same directory skip list and extension allow list as the
+    local :func:`_scan_with_regex`, plus a size guard so we never fetch
+    large binary/generated files.
+    """
+    path = Path(remote_file.path)
+    parts = path.parts
+
+    if any(d in parts for d in _SKIP_DIRS):
+        return False
+    if path.suffix.lower() not in _SCAN_EXTENSIONS:
+        return False
+    # size == 0 means the provider didn't return size (e.g. GitLab tree API);
+    # allow those through and let the content call decide.
+    if remote_file.size > 0 and remote_file.size > _MAX_REMOTE_FILE_SIZE:
+        logger.debug("Skipping large remote file (%d bytes): %s", remote_file.size, remote_file.path)
+        return False
+    return True
+
+
+def _is_openapi_file_remote(remote_file: "RemoteFile") -> bool:
+    """Return True if the remote file looks like an OpenAPI/Swagger spec."""
+    return Path(remote_file.path).name.lower() in _OPENAPI_FILENAMES
+
+
+def _parse_openapi_text(text: str, label: str) -> list[Endpoint]:
+    """Parse OpenAPI/Swagger YAML or JSON from *text* and return endpoints."""
+    try:
+        if label.endswith(".json"):
+            spec = json.loads(text)
+        else:
+            spec = yaml.safe_load(text)
+    except Exception as exc:
+        logger.warning("Could not parse OpenAPI spec (%s): %s", label, exc)
+        return []
+
+    if not isinstance(spec, dict):
+        return []
+
+    endpoints: list[Endpoint] = []
+    base_path = spec.get("basePath", "")
+
+    for route, path_item in spec.get("paths", {}).items():
+        if not isinstance(path_item, dict):
+            continue
+        for method in _HTTP_METHODS:
+            if method in path_item:
+                endpoints.append(Endpoint(method=method.upper(), path=base_path + route))
+
+    return endpoints
+
+
+def _scan_text_with_regex(text: str, filename: str) -> list[Endpoint]:
+    """Apply all heuristic regex patterns to *text* and return endpoints."""
+    endpoints: list[Endpoint] = []
+    for pattern, method_group, path_group, label in _PATTERNS:
+        for match in pattern.finditer(text):
+            try:
+                method = (
+                    match.group(method_group).upper()
+                    if method_group is not None
+                    else "ANY"
+                )
+                path = match.group(path_group) or "/"
+            except IndexError:
+                continue
+
+            if method == "REQUEST":
+                method = "ANY"
+
+            ep = Endpoint(method=method, path=path)
+            if ep not in endpoints:
+                endpoints.append(ep)
+                logger.debug("[%s] %s %s  (%s)", label, method, path, filename)
+    return endpoints
+
+
+def analyze_remote(
+    client: "RemoteRepoClient",
+    owner: str,
+    repo: str,
+    ref: str = "HEAD",
+) -> AnalysisResult:
+    """Analyse a remote repository via API calls — no local clone required.
+
+    Mirrors the two-phase strategy of :func:`analyze`:
+
+    1. **Phase 1 – OpenAPI**: Fetch any OpenAPI/Swagger spec files found in
+       the file tree and parse them.  Returns immediately if endpoints are
+       found.
+    2. **Phase 2 – Regex**: Fetch each source file that passes the extension
+       and size filters and apply heuristic regex patterns in memory.
+
+    Args:
+        client: A :class:`~remote_repo_client.RemoteRepoClient` instance
+                (:class:`~remote_repo_client.GitHubRemoteClient` or
+                :class:`~remote_repo_client.GitLabRemoteClient`).
+        owner:  Organisation or user slug.
+        repo:   Repository slug.
+        ref:    Branch, tag, or commit SHA to scan.  Defaults to ``"HEAD"``.
+
+    Returns:
+        :class:`AnalysisResult` containing the analysis method and endpoints.
+    """
+    logger.info("Remote analysis: %s/%s @ %s", owner, repo, ref)
+
+    all_files = client.list_files(owner, repo, ref=ref)
+
+    # --- Phase 1: OpenAPI specs -------------------------------------------------
+    spec_files = [f for f in all_files if _is_openapi_file_remote(f)]
+    if spec_files:
+        all_endpoints: list[Endpoint] = []
+        for remote_file in spec_files:
+            logger.info("Fetching OpenAPI spec: %s", remote_file.path)
+            try:
+                text = client.get_file_content(owner, repo, remote_file.path, ref=ref)
+            except Exception as exc:
+                logger.warning("Could not fetch %s: %s", remote_file.path, exc)
+                continue
+            all_endpoints.extend(_parse_openapi_text(text, label=remote_file.path))
+
+        if all_endpoints:
+            logger.info("Remote OpenAPI analysis found %d endpoints", len(all_endpoints))
+            return AnalysisResult(method="OpenAPI", endpoints=all_endpoints)
+
+    # --- Phase 2: Regex heuristics ----------------------------------------------
+    logger.info("No OpenAPI spec found – falling back to remote regex heuristics")
+    scannable = [f for f in all_files if _should_scan_remote(f)]
+    logger.info("%d files selected for regex scan out of %d total", len(scannable), len(all_files))
+
+    endpoints: list[Endpoint] = []
+    for remote_file in scannable:
+        try:
+            text = client.get_file_content(owner, repo, remote_file.path, ref=ref)
+        except Exception as exc:
+            logger.warning("Could not fetch %s: %s", remote_file.path, exc)
+            continue
+
+        for ep in _scan_text_with_regex(text, filename=remote_file.path):
+            if ep not in endpoints:
+                endpoints.append(ep)
+
+    logger.info("Remote regex analysis found %d endpoints", len(endpoints))
     return AnalysisResult(method="Regex", endpoints=endpoints)

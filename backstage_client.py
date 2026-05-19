@@ -4,13 +4,21 @@ backstage_client.py
 Authenticates with a Backstage instance and retrieves Component entities,
 optionally filtered by a search keyword. Extracts the source-control
 repository URL from well-known annotations.
+
+Each service dict yielded by ``get_services()`` now includes:
+
+* ``name``     – component name from Backstage metadata
+* ``repo_url`` – clonable git URL (HTTPS)
+* ``provider`` – ``"github"`` | ``"gitlab"`` | ``"unknown"``
+* ``owner``    – organisation / user slug  (empty string if unknown)
+* ``repo``     – repository slug            (empty string if unknown)
 """
 
 from __future__ import annotations
 
 import logging
 from typing import Generator, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -71,7 +79,12 @@ class BackstageClient:
                          are returned.
 
         Yields:
-            Dicts with keys ``name``, ``repo_url``.
+            Dicts with keys:
+            - ``name``     – component name
+            - ``repo_url`` – clonable git URL
+            - ``provider`` – ``"github"`` | ``"gitlab"`` | ``"unknown"``
+            - ``owner``    – org/user slug (empty string if unparseable)
+            - ``repo``     – repository slug (empty string if unparseable)
         """
         for entity in self._iter_entities(kind="Component"):
             name: str = entity.get("metadata", {}).get("name", "unknown")
@@ -87,7 +100,19 @@ class BackstageClient:
                 )
                 continue
 
-            yield {"name": name, "repo_url": repo_url}
+            provider, owner, repo = _parse_repo_info(
+                repo_url,
+                github_base_url=self.github_base_url,
+                gitlab_base_url=self.gitlab_base_url,
+            )
+
+            yield {
+                "name": name,
+                "repo_url": repo_url,
+                "provider": provider,
+                "owner": owner,
+                "repo": repo,
+            }
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -151,3 +176,57 @@ class BackstageClient:
             return value
 
         return None
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def _parse_repo_info(
+    repo_url: str,
+    github_base_url: str = "https://github.com",
+    gitlab_base_url: str = "https://gitlab.com",
+) -> tuple[str, str, str]:
+    """Parse ``(provider, owner, repo)`` from a git HTTPS URL.
+
+    Strips trailing ``.git`` before splitting on ``/`` so that both
+    ``https://github.com/org/repo`` and ``https://github.com/org/repo.git``
+    are handled correctly.
+
+    Args:
+        repo_url:        Full HTTPS clone URL.
+        github_base_url: Base URL of the GitHub host (for GHE detection).
+        gitlab_base_url: Base URL of the GitLab host (for self-hosted detection).
+
+    Returns:
+        A tuple ``(provider, owner, repo)`` where *provider* is
+        ``"github"``, ``"gitlab"``, or ``"unknown"``.
+        *owner* and *repo* are empty strings when parsing fails.
+    """
+    clean = repo_url.rstrip("/").removesuffix(".git")
+
+    parsed = urlparse(clean)
+    path_parts = [p for p in parsed.path.split("/") if p]
+
+    if len(path_parts) < 2:
+        return "unknown", "", ""
+
+    owner, repo = path_parts[-2], path_parts[-1]
+
+    # Determine provider by comparing the host against configured base URLs.
+    netloc = parsed.netloc.lower()
+    github_host = urlparse(github_base_url).netloc.lower()
+    gitlab_host = urlparse(gitlab_base_url).netloc.lower()
+
+    if netloc == github_host or netloc == "api.github.com":
+        provider = "github"
+    elif netloc == gitlab_host:
+        provider = "gitlab"
+    elif "github" in netloc:
+        provider = "github"
+    elif "gitlab" in netloc:
+        provider = "gitlab"
+    else:
+        provider = "unknown"
+
+    return provider, owner, repo

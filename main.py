@@ -34,8 +34,9 @@ import sys
 from pathlib import Path
 
 from backstage_client import BackstageClient
-from codebase_analyzer import analyze
+from codebase_analyzer import analyze, analyze_remote
 from output_generator import ServiceReport, write_reports
+from remote_repo_client import build_remote_client
 from source_control import cloned_repo
 
 
@@ -79,13 +80,47 @@ def run(args: argparse.Namespace) -> None:
     for svc in services:
         name = svc["name"]
         repo_url = svc["repo_url"]
+        provider = svc.get("provider", "unknown")
+        owner = svc.get("owner", "")
+        repo = svc.get("repo", "")
+
         logging.info("─" * 60)
         logging.info("Analysing service: %s", name)
         logging.info("Repository:        %s", repo_url)
 
         try:
-            with cloned_repo(repo_url) as local_path:
-                result = analyze(local_path)
+            if args.no_clone:
+                # ---- API-based mode (no local clone) -------------------------
+                if provider == "unknown" or not owner or not repo:
+                    logging.warning(
+                        "Cannot determine provider/owner/repo for '%s' (%s) – "
+                        "falling back to clone mode.",
+                        name, repo_url,
+                    )
+                    with cloned_repo(repo_url) as local_path:
+                        result = analyze(local_path)
+                else:
+                    token = (
+                        args.github_token if provider == "github"
+                        else args.gitlab_token
+                    )
+                    base_url = (
+                        args.github_url if provider == "github"
+                        else args.gitlab_url
+                    )
+                    remote_client = build_remote_client(
+                        provider=provider,
+                        base_url=base_url,
+                        token=token,
+                    )
+                    result = analyze_remote(
+                        remote_client, owner, repo, ref=args.api_ref
+                    )
+            else:
+                # ---- Clone mode (default) ------------------------------------
+                with cloned_repo(repo_url) as local_path:
+                    result = analyze(local_path)
+
         except Exception as exc:
             logging.error("Failed to process '%s': %s – skipping", name, exc)
             continue
@@ -159,6 +194,33 @@ def _build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("GITLAB_BASE_URL", "https://gitlab.com"),
         help="Base URL for GitLab (override for self-hosted GitLab). "
              "Can also be set via GITLAB_BASE_URL env var.",
+    )
+
+    # No-clone / API mode
+    parser.add_argument(
+        "--no-clone",
+        action="store_true",
+        default=False,
+        help="Use REST API to fetch files instead of git cloning. "
+             "Requires --github-token and/or --gitlab-token.",
+    )
+    parser.add_argument(
+        "--github-token",
+        default=os.environ.get("GITHUB_TOKEN", ""),
+        help="Personal Access Token for GitHub API calls (used with --no-clone). "
+             "Can also be set via GITHUB_TOKEN env var.",
+    )
+    parser.add_argument(
+        "--gitlab-token",
+        default=os.environ.get("GITLAB_TOKEN", ""),
+        help="Personal Access Token for GitLab API calls (used with --no-clone). "
+             "Can also be set via GITLAB_TOKEN env var.",
+    )
+    parser.add_argument(
+        "--api-ref",
+        default="HEAD",
+        metavar="REF",
+        help="Branch, tag, or commit SHA to scan in --no-clone mode (default: HEAD).",
     )
     parser.add_argument(
         "--output-dir",
